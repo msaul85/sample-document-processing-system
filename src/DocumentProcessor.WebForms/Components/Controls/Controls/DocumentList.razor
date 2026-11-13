@@ -1,0 +1,148 @@
+@* Ported from Controls/DocumentList.ascx (+ .ascx.cs). The Repeater is now an @foreach over the
+   Documents parameter (replacing the old Bind(IList<Document>) method); Razor encodes every value,
+   so the old Encode()/HttpUtility.HtmlEncode helper is gone. The control's public events are
+   EventCallbacks with the same bare names: RefreshRequested, ViewSummaryRequested, DeleteRequested. *@
+@using DocumentProcessor.WebForms.Models
+
+<div class="list-header">
+    <h2 class="list-title">
+        Documents <span class="list-title-count">(@DocumentCount)</span>
+    </h2>
+    <a href="#" id="@(IdPrefix)_RefreshButton" class="btn-quiet" @onclick="RefreshButton_Click" @onclick:preventDefault>
+        <i class="bi bi-arrow-clockwise"></i>Refresh
+    </a>
+</div>
+
+@if (DocumentCount == 0)
+{
+    <p class="empty-state mb-0">No documents yet</p>
+}
+
+@foreach (var document in Documents ?? Array.Empty<Document>())
+{
+    var item = document;
+    <article class="doc-card">
+        <span class="file-tag @FileTagCss(item.FileExtension)">
+            @FileLabel(item.FileExtension)
+        </span>
+
+        <div class="doc-card-body">
+            <div class="doc-card-heading">
+                <span class="doc-name" title="@(item.OriginalFileName ?? string.Empty)">
+                    @(item.OriginalFileName ?? string.Empty)
+                </span>
+                <span class="status-pill @StatusCss(item.Status)">
+                    <i class="bi @StatusIcon(item.Status)"></i>@item.Status
+                </span>
+            </div>
+            <p class="doc-meta">
+                <i class="bi bi-clock"></i>@UploadedText(item.UploadedAt)
+            </p>
+            <p class="doc-summary">@SummaryPreview(item.Summary)</p>
+        </div>
+
+        <div class="doc-actions">
+            @if (HasSummary(item.Summary))
+            {
+                <a href="#" class="btn-icon btn-icon-view" title="View summary"
+                   @onclick="() => ViewSummary_Click(item.Id)" @onclick:preventDefault><i class="bi bi-eye"></i></a>
+            }
+            else
+            {
+                @* A disabled LinkButton rendered an <a> with no href and the aspNetDisabled class. *@
+                <a class="aspNetDisabled btn-icon btn-icon-view" title="View summary"><i class="bi bi-eye"></i></a>
+            }
+            <a href="#" class="btn-icon btn-icon-delete" title="Delete"
+               @onclick="() => Delete_Click(item.Id)" @onclick:preventDefault><i class="bi bi-trash3"></i></a>
+        </div>
+    </article>
+}
+
+@code {
+    /// <summary>
+    /// Client-id prefix of this instance (the user control was a naming container). On the legacy
+    /// Default.aspx under clientIDMode="AutoID" this was "ctl00_MainContent_Documents".
+    /// </summary>
+    [Parameter] public string IdPrefix { get; set; } = "ctl00_MainContent_Documents";
+
+    /// <summary>UniqueID prefix of this instance ("ctl00$MainContent$Documents" on Default.aspx).</summary>
+    [Parameter] public string NamePrefix { get; set; } = "ctl00$MainContent$Documents";
+
+    /// <summary>The documents to show; replaces the legacy Bind(IList&lt;Document&gt;) call.</summary>
+    [Parameter] public IList<Document>? Documents { get; set; }
+
+    [Parameter] public EventCallback RefreshRequested { get; set; }
+
+    // PORT-TODO
+    // {"was": "DocumentProcessor.WebForms.Controls.DocumentEventArgs", "note": "ViewSummaryRequested and DeleteRequested now pass the document Guid directly (EventCallback<Guid>) instead of DocumentEventArgs; the Default page port must bind handlers taking a Guid.", "files": ["Default.aspx", "Default.aspx.cs"]}
+    [Parameter] public EventCallback<Guid> ViewSummaryRequested { get; set; }
+
+    [Parameter] public EventCallback<Guid> DeleteRequested { get; set; }
+
+    private int DocumentCount => Documents?.Count ?? 0;
+
+    private async Task RefreshButton_Click()
+    {
+        await RefreshRequested.InvokeAsync();
+    }
+
+    private async Task ViewSummary_Click(Guid documentId)
+    {
+        await ViewSummaryRequested.InvokeAsync(documentId);
+    }
+
+    private async Task Delete_Click(Guid documentId)
+    {
+        await DeleteRequested.InvokeAsync(documentId);
+    }
+
+    private static string FileLabel(string? extension)
+    {
+        if (string.IsNullOrEmpty(extension))
+        {
+            return "FILE";
+        }
+
+        var label = extension.TrimStart('.').ToUpperInvariant();
+        return label.Length > 0 ? label : "FILE";
+    }
+
+    private static string FileTagCss(string? extension)
+    {
+        var isPdf = string.Equals(extension, ".pdf", StringComparison.OrdinalIgnoreCase);
+        return isPdf ? string.Empty : "file-tag-text";
+    }
+
+    private static string StatusCss(DocumentStatus status) => status switch
+    {
+        DocumentStatus.Processed => "status-processed",
+        DocumentStatus.Processing => "status-processing",
+        DocumentStatus.Failed => "status-failed",
+        _ => "status-pending"
+    };
+
+    private static string StatusIcon(DocumentStatus status) => status switch
+    {
+        DocumentStatus.Processed => "bi-check-lg",
+        DocumentStatus.Processing => "bi-hourglass-split",
+        DocumentStatus.Failed => "bi-x-lg",
+        _ => "bi-clock"
+    };
+
+    private static string UploadedText(DateTimeOffset uploadedAt)
+    {
+        return uploadedAt == default
+            ? "Upload time unknown"
+            : uploadedAt.ToLocalTime().ToString("MMM d, yyyy h:mm tt");
+    }
+
+    private static string SummaryPreview(string? summary)
+    {
+        return string.IsNullOrWhiteSpace(summary) ? "No summary yet." : summary;
+    }
+
+    private static bool HasSummary(string? summary)
+    {
+        return !string.IsNullOrWhiteSpace(summary);
+    }
+}

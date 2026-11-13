@@ -1,0 +1,44 @@
+@using Microsoft.AspNetCore.Hosting
+@inject IWebHostEnvironment Environment
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <base href="/" />
+    <link rel="stylesheet" href="Content/bootstrap.min.css" />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" />
+    @* Stamped with the file's last write time so browsers pick up CSS edits instead of a cached copy
+       (ported from Site.Master's Page_Load). *@
+    <link id="SiteStylesheet" rel="stylesheet" href="@siteStylesheetHref" />
+    <link rel="icon" type="image/png" href="favicon.png" />
+    <HeadOutlet @rendermode="PageRenderMode" />
+</head>
+<body>
+    <Routes @rendermode="PageRenderMode" />
+    <script src="Scripts/bootstrap.bundle.min.js"></script>
+    <script src="_framework/blazor.web.js"></script>
+</body>
+</html>
+
+@code {
+    [CascadingParameter]
+    private HttpContext HttpContext { get; set; } = default!;
+
+    private string siteStylesheetHref = "Content/Site.css";
+
+    // Interactive server everywhere, except pages marked [ExcludeFromInteractiveRouting]
+    // (e.g. the error page re-executed by the exception handler), which render statically.
+    private IComponentRenderMode? PageRenderMode =>
+        HttpContext.AcceptsInteractiveRouting() ? InteractiveServer : null;
+
+    protected override void OnInitialized()
+    {
+        var cssFile = Environment.WebRootFileProvider.GetFileInfo("Content/Site.css");
+        if (cssFile.Exists)
+        {
+            siteStylesheetHref = "Content/Site.css?v=" + cssFile.LastModified.UtcTicks;
+        }
+    }
+}

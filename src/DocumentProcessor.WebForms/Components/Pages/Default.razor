@@ -1,0 +1,449 @@
+@page "/"
+@page "/Default"
+@page "/Default.aspx"
+@implements IAsyncDisposable
+@using System.IO
+@using Microsoft.EntityFrameworkCore
+@using Microsoft.Extensions.Logging
+@using DocumentProcessor.WebForms.Data
+@using DocumentProcessor.WebForms.Services
+@* PORT-TODO *@
+@* {"was": "DocumentProcessor.WebForms.Data.DocumentDbContext", "note": "This page creates a short-lived context per operation through IDbContextFactory, because a Blazor Server circuit is long-lived and the status poll runs alongside user clicks. Program.cs must register the context with builder.Services.AddDbContextFactory<DocumentDbContext>(...) using the connection resolved by DatabaseConnectionResolver (AddDbContextFactory also registers the scoped DocumentDbContext), plus DocumentProcessingQueue (singleton), the DocumentProcessingWorker hosted service and IDocumentStorage.", "files": ["Program.cs"]} *@
+@inject IDbContextFactory<DocumentDbContext> DbFactory
+@inject IDocumentStorage Storage
+@inject DocumentProcessingQueue ProcessingQueue
+@inject ILogger<Default> Logger
+
+@* Interactive server rendering comes from App.razor (<Routes @rendermode="PageRenderMode" />),
+   which covers this page; the legacy UpdatePanel/UpdateProgress pair is no longer needed because
+   the component re-renders in place. *@
+
+<PageTitle>Document Processor</PageTitle>
+
+<div class="app-grid">
+    <section>
+        @* The uploader raises UploadRequested with the checked files; the page stores them,
+           queues summarization and shows its own messages through Notifications. *@
+        <DocumentUploader IdPrefix="ctl00_MainContent_Uploader"
+                          NamePrefix="ctl00$MainContent$Uploader"
+                          UploadRequested="Uploader_UploadRequested"
+                          Notifications="notifications" />
+    </section>
+
+    <section>
+        <div id="ctl00_MainContent_ListPanel">
+            <DocumentList IdPrefix="ctl00_MainContent_Documents"
+                          NamePrefix="ctl00$MainContent$Documents"
+                          Documents="documents"
+                          RefreshRequested="Documents_RefreshRequested"
+                          ViewSummaryRequested="Documents_ViewSummaryRequested"
+                          DeleteRequested="Documents_DeleteRequested" />
+
+            @if (summaryModalVisible)
+            {
+                <div id="ctl00_MainContent_SummaryModal" class="modal fade show d-block modal-backdrop-tint" tabindex="-1">
+                    <div class="modal-dialog">
+                        <div class="modal-content">
+                            <div class="modal-header">
+                                <h6 class="modal-title">@summaryModalTitle</h6>
+                                <a href="#" id="ctl00_MainContent_SummaryModalDismiss" class="btn-close"
+                                   @onclick="CloseSummaryModal_Click" @onclick:preventDefault></a>
+                            </div>
+                            <div class="modal-body">
+                                <p>@summaryModalBody</p>
+                            </div>
+                            <div class="modal-footer">
+                                <a href="#" id="ctl00_MainContent_SummaryModalClose" class="btn btn-sm btn-secondary"
+                                   @onclick="CloseSummaryModal_Click" @onclick:preventDefault>Close</a>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            }
+
+            @if (deleteModalVisible)
+            {
+                <div id="ctl00_MainContent_DeleteModal" class="modal fade show d-block modal-backdrop-tint" tabindex="-1">
+                    <div class="modal-dialog modal-sm">
+                        <div class="modal-content">
+                            <div class="modal-header">
+                                <h6 class="modal-title">Delete document?</h6>
+                                <a href="#" id="ctl00_MainContent_DeleteModalDismiss" class="btn-close"
+                                   @onclick="CancelDelete_Click" @onclick:preventDefault></a>
+                            </div>
+                            <div class="modal-body">
+                                <p class="mb-0"><strong>@deleteModalFileName</strong></p>
+                            </div>
+                            <div class="modal-footer">
+                                <a href="#" id="ctl00_MainContent_CancelDeleteButton" class="btn btn-sm btn-secondary"
+                                   @onclick="CancelDelete_Click" @onclick:preventDefault>Cancel</a>
+                                <a href="#" id="ctl00_MainContent_ConfirmDeleteButton" class="btn btn-sm btn-danger"
+                                   @onclick="ConfirmDelete_Click" @onclick:preventDefault>Delete</a>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            }
+        </div>
+
+        @* Legacy UpdateProgress (DisplayAfter="300"): rendered hidden, shown only while a list
+           operation has taken longer than 300 ms. *@
+        <div id="ctl00_MainContent_ListProgress" role="status" aria-hidden="@(showProgress ? "false" : "true")"
+             style="@(showProgress ? "display:block;" : "display:none;")">
+            <div class="update-progress"><span class="spinner-border"></span></div>
+        </div>
+    </section>
+</div>
+
+@code {
+    private const int MaxDocumentsShown = 50;
+    private const int ProgressDelayMilliseconds = 300;
+    private static readonly TimeSpan StatusPollInterval = TimeSpan.FromSeconds(3);
+
+    private List<Document> documents = new();
+    private List<Notification> notifications = new();
+
+    // Documents queued from this page, so their completion can be announced once the
+    // background worker finishes them.
+    private readonly Dictionary<Guid, string> awaitingSummary = new();
+
+    private bool summaryModalVisible;
+    private string summaryModalTitle = string.Empty;
+    private string summaryModalBody = string.Empty;
+
+    // Replaces ViewState["DeleteTargetId"].
+    private Guid? deleteTargetId;
+    private bool deleteModalVisible;
+    private string deleteModalFileName = string.Empty;
+
+    private int busyOperations;
+    private bool showProgress;
+
+    private readonly CancellationTokenSource pollingCancellation = new();
+    private Task? pollingTask;
+
+    protected override async Task OnInitializedAsync()
+    {
+        // Legacy Page_Load: if (!IsPostBack) LoadDocuments();
+        await LoadDocumentsAsync();
+    }
+
+    protected override void OnAfterRender(bool firstRender)
+    {
+        // Start polling only once the circuit is live (not during prerendering).
+        if (firstRender && RendererInfo.IsInteractive && pollingTask == null)
+        {
+            pollingTask = PollStatusAsync(pollingCancellation.Token);
+        }
+    }
+
+    private async Task Uploader_UploadRequested(UploadEventArgs e)
+    {
+        // Each upload starts with a fresh set of messages, as each postback did.
+        notifications = new List<Notification>();
+
+        foreach (var file in e.Files)
+        {
+            var name = Path.GetFileName(file.Name);
+
+            try
+            {
+                var document = await StoreAsync(e, file, name);
+
+                // Summarizing now runs on the background queue instead of the request; the list
+                // shows the Pending/Processing status and is refreshed by polling.
+                await ProcessingQueue.EnqueueAsync(document.Id);
+                awaitingSummary[document.Id] = name;
+
+                Notify(string.Format("'{0}' uploaded; summarizing in the background", name), NotificationLevel.Success);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "Upload failed for {FileName}.", name);
+                Notify(string.Format("'{0}' failed to upload", name), NotificationLevel.Danger);
+            }
+        }
+
+        await LoadDocumentsAsync();
+    }
+
+    private async Task Documents_RefreshRequested()
+    {
+        await RunWithProgressAsync(LoadDocumentsAsync);
+    }
+
+    private async Task Documents_ViewSummaryRequested(Guid documentId)
+    {
+        await RunWithProgressAsync(async () =>
+        {
+            var document = await FindAsync(documentId);
+
+            if (document == null)
+            {
+                Notify("That document is no longer available.", NotificationLevel.Warning);
+                await LoadDocumentsAsync();
+                return;
+            }
+
+            // Razor encodes on output, replacing Server.HtmlEncode.
+            summaryModalTitle = document.OriginalFileName ?? string.Empty;
+            summaryModalBody = document.Summary ?? string.Empty;
+            summaryModalVisible = true;
+        });
+    }
+
+    private void CloseSummaryModal_Click()
+    {
+        summaryModalVisible = false;
+    }
+
+    private async Task Documents_DeleteRequested(Guid documentId)
+    {
+        await RunWithProgressAsync(async () =>
+        {
+            var document = await FindAsync(documentId);
+
+            if (document == null)
+            {
+                Notify("That document is no longer available.", NotificationLevel.Warning);
+                await LoadDocumentsAsync();
+                return;
+            }
+
+            deleteTargetId = document.Id;
+            deleteModalFileName = document.OriginalFileName ?? string.Empty;
+            deleteModalVisible = true;
+        });
+    }
+
+    private void CancelDelete_Click()
+    {
+        deleteTargetId = null;
+        deleteModalVisible = false;
+    }
+
+    private async Task ConfirmDelete_Click()
+    {
+        if (deleteTargetId is not Guid documentId)
+        {
+            deleteModalVisible = false;
+            return;
+        }
+
+        await RunWithProgressAsync(async () =>
+        {
+            try
+            {
+                // Soft delete: every query in this application filters IsDeleted out itself.
+                await using (var db = await DbFactory.CreateDbContextAsync())
+                {
+                    var document = await db.Documents.FirstOrDefaultAsync(d => d.Id == documentId && !d.IsDeleted);
+
+                    if (document != null)
+                    {
+                        document.IsDeleted = true;
+                        await db.SaveChangesAsync();
+                    }
+                }
+
+                awaitingSummary.Remove(documentId);
+                deleteTargetId = null;
+                deleteModalVisible = false;
+                await LoadDocumentsAsync();
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "Delete failed for document {DocumentId}.", documentId);
+                Notify("Could not delete the document.", NotificationLevel.Danger);
+            }
+        });
+    }
+
+    private async Task LoadDocumentsAsync()
+    {
+        try
+        {
+            await using var db = await DbFactory.CreateDbContextAsync();
+
+            documents = await db.Documents
+                .AsNoTracking()
+                .Where(d => !d.IsDeleted)
+                .OrderByDescending(d => d.UploadedAt)
+                .Take(MaxDocumentsShown)
+                .ToListAsync();
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Could not load documents.");
+            documents = new List<Document>();
+            Notify("Could not load documents.", NotificationLevel.Danger);
+        }
+    }
+
+    private async Task<Document?> FindAsync(Guid documentId)
+    {
+        await using var db = await DbFactory.CreateDbContextAsync();
+        return await db.Documents
+            .AsNoTracking()
+            .FirstOrDefaultAsync(d => d.Id == documentId && !d.IsDeleted);
+    }
+
+    private async Task<Document> StoreAsync(UploadEventArgs e, IBrowserFile file, string name)
+    {
+        var document = new Document
+        {
+            FileName = name,
+            OriginalFileName = name,
+            FileExtension = Path.GetExtension(name).ToLowerInvariant(),
+            ContentType = string.IsNullOrEmpty(file.ContentType) ? "application/octet-stream" : file.ContentType,
+            FileSize = file.Size,
+            UploadedAt = DateTimeOffset.UtcNow,
+            Status = DocumentStatus.Pending
+        };
+
+        // The browser stream only supports asynchronous reads (50 MB cap applied by
+        // UploadEventArgs.OpenReadStream), so buffer it before handing it to the storage.
+        await using (var upload = e.OpenReadStream(file))
+        using (var buffer = new MemoryStream())
+        {
+            await upload.CopyToAsync(buffer);
+            buffer.Position = 0;
+            document.StoragePath = Storage.Save(buffer, name);
+        }
+
+        await using (var db = await DbFactory.CreateDbContextAsync())
+        {
+            db.Documents.Add(document);
+            await db.SaveChangesAsync();
+        }
+
+        return document;
+    }
+
+    /// <summary>
+    /// Re-reads the list while any document is still Pending or Processing, so the status
+    /// pills move to Processed/Failed without a manual refresh.
+    /// </summary>
+    private async Task PollStatusAsync(CancellationToken cancellationToken)
+    {
+        using var timer = new PeriodicTimer(StatusPollInterval);
+
+        try
+        {
+            while (await timer.WaitForNextTickAsync(cancellationToken))
+            {
+                await InvokeAsync(async () =>
+                {
+                    var hasWork = awaitingSummary.Count > 0 || documents.Any(d =>
+                        d.Status == DocumentStatus.Pending || d.Status == DocumentStatus.Processing);
+
+                    if (!hasWork)
+                    {
+                        return;
+                    }
+
+                    await LoadDocumentsAsync();
+                    AnnounceFinishedDocuments();
+                    StateHasChanged();
+                });
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Circuit closed.
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Document status polling stopped.");
+        }
+    }
+
+    private void AnnounceFinishedDocuments()
+    {
+        if (awaitingSummary.Count == 0)
+        {
+            return;
+        }
+
+        var listed = documents.ToDictionary(d => d.Id);
+
+        foreach (var pending in awaitingSummary.ToList())
+        {
+            if (!listed.TryGetValue(pending.Key, out var document))
+            {
+                // Deleted, or pushed out of the newest 50; stop tracking it.
+                awaitingSummary.Remove(pending.Key);
+                continue;
+            }
+
+            if (document.Status == DocumentStatus.Processed)
+            {
+                Notify(string.Format("'{0}' processed", pending.Value), NotificationLevel.Success);
+                awaitingSummary.Remove(pending.Key);
+            }
+            else if (document.Status == DocumentStatus.Failed)
+            {
+                Notify(string.Format("'{0}' could not be summarized", pending.Value), NotificationLevel.Danger);
+                awaitingSummary.Remove(pending.Key);
+            }
+        }
+    }
+
+    private void Notify(string text, NotificationLevel level)
+    {
+        // A new list instance so the uploader sees a changed parameter.
+        notifications = new List<Notification>(notifications) { new Notification(text, level) };
+    }
+
+    /// <summary>Runs a list operation, showing the progress spinner if it takes longer than 300 ms.</summary>
+    private async Task RunWithProgressAsync(Func<Task> operation)
+    {
+        busyOperations++;
+        _ = ShowProgressAfterDelayAsync();
+
+        try
+        {
+            await operation();
+        }
+        finally
+        {
+            busyOperations--;
+            if (busyOperations == 0)
+            {
+                showProgress = false;
+            }
+        }
+    }
+
+    private async Task ShowProgressAfterDelayAsync()
+    {
+        await Task.Delay(ProgressDelayMilliseconds);
+
+        await InvokeAsync(() =>
+        {
+            if (busyOperations > 0 && !showProgress)
+            {
+                showProgress = true;
+                StateHasChanged();
+            }
+        });
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        pollingCancellation.Cancel();
+
+        if (pollingTask != null)
+        {
+            try
+            {
+                await pollingTask;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        }
+
+        pollingCancellation.Dispose();
+    }
+}

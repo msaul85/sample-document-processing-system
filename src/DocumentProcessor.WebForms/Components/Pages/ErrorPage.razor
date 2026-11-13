@@ -1,0 +1,37 @@
+@page "/Error"
+@page "/ErrorPage"
+@page "/ErrorPage.aspx"
+
+<PageTitle>Something went wrong</PageTitle>
+
+<div class="empty-state">
+    <h1>@headingText</h1>
+    <p>@messageText</p>
+    <a href="/" class="btn-brand">Back to documents</a>
+</div>
+
+@code {
+    // Reached through UseExceptionHandler("/Error") and
+    // UseStatusCodePagesWithReExecute("/Error", "?code={0}") in Program.cs, which replace
+    // the legacy customErrors redirect to ErrorPage.aspx. The page renders statically
+    // (no interactive render mode) so it still works when the failing request is re-executed.
+    [SupplyParameterFromQuery(Name = "code")]
+    private string? Code { get; set; }
+
+    private string headingText = string.Empty;
+    private string messageText = string.Empty;
+
+    protected override void OnParametersSet()
+    {
+        if (Code == "404")
+        {
+            headingText = "404 - Page Not Found";
+            messageText = "Sorry, there's nothing at this address.";
+        }
+        else
+        {
+            headingText = "Something went wrong";
+            messageText = "The error has been written to the application trace log.";
+        }
+    }
+}

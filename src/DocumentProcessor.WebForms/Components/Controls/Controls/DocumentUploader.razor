@@ -1,0 +1,238 @@
+@using System.IO
+@using System.Linq
+@using Microsoft.Extensions.Options
+@using DocumentProcessor.WebForms.Configuration
+@using DocumentProcessor.WebForms.Models
+@using DocumentProcessor.WebForms.Services
+@inject IOptions<StorageOptions> StorageOptionsAccessor
+
+<h1 class="upload-title">Upload a document and I'll summarize it.</h1>
+<p class="upload-subtitle">
+    @fileTypeSummary
+    &middot; up to @Storage.MaxFileSizeMegabytes MB
+</p>
+
+<div class="dropzone">
+    @* The file input is stretched over the whole zone by .dropzone-input, which is what
+       makes dropping files onto it work without any script. *@
+    <InputFile @key="pickerGeneration" id="@($"{IdPrefix}_FilePicker")" name="@($"{NamePrefix}$FilePicker")"
+               multiple class="dropzone-input" title="Drag files here or click to browse"
+               disabled="@submitting" OnChange="OnFilesChosen" />
+    <div class="dropzone-icon"><i class="bi bi-cloud-arrow-up"></i></div>
+    <p class="dropzone-hint">Drag files here</p>
+    <span class="btn-brand">Browse files</span>
+</div>
+
+@* The list of picked files, rebuilt whenever the file input changes. *@
+<ul id="selectedList" class="selected-list">
+    @foreach (var file in selectedFiles)
+    {
+        <li class="selected-item"><small>@($"{file.Name} ({FormatSize(file.Size)})")</small></li>
+    }
+</ul>
+
+<div id="uploadActions" class="d-flex gap-2 mt-3" style="@(selectedFiles.Count > 0 ? "" : "display: none;")">
+    @* A link rather than a button keeps the spinner markup and the .btn-brand styling of the
+       original LinkButton; a second click while busy is ignored by the handler. *@
+    <a href="#" id="@($"{IdPrefix}_UploadButton")" class="@(submitting ? "btn-brand is-busy" : "btn-brand")"
+       @onclick="UploadButton_Click" @onclick:preventDefault>
+        <span id="uploadIdleLabel" style="@(submitting ? "display: none;" : "")">@IdleLabel</span>
+        <span id="uploadBusyLabel" style="@(submitting ? "" : "display: none;")">
+            <span class="spinner-border spinner-border-sm me-1"></span>Uploading...
+        </span>
+    </a>
+    <button type="button" id="clearButton" class="btn-quiet" disabled="@submitting" @onclick="Reset">Clear</button>
+</div>
+
+@* Summarizing can take a while, so say so while the upload runs. *@
+<p id="uploadStatus" class="upload-status" style="@(string.IsNullOrEmpty(statusText) ? "display: none;" : "")">@statusText</p>
+
+@foreach (var notice in AllNotifications)
+{
+    <div class="notice notice-@notice.CssSuffix">
+        <i class="bi @notice.IconClass"></i>
+        <span>@notice.Text</span>
+    </div>
+}
+
+@code {
+    private readonly List<Notification> _notifications = new();
+    private List<IBrowserFile> selectedFiles = new();
+    private int pickerGeneration;
+    private bool submitting;
+    private string statusText = string.Empty;
+    private string fileTypeSummary = string.Empty;
+
+    /// <summary>Client id of this control instance (Web Forms naming container), e.g. "MainContent_Uploader".</summary>
+    [Parameter] public string IdPrefix { get; set; } = "MainContent_Uploader";
+
+    /// <summary>UniqueID of this control instance, e.g. "ctl00$MainContent$Uploader".</summary>
+    [Parameter] public string NamePrefix { get; set; } = "ctl00$MainContent$Uploader";
+
+    // PORT-TODO
+    // {"note": "The Default page port must bind <DocumentUploader UploadRequested=\"Uploader_UploadRequested\" Notifications=\"notifications\" /> (or keep an @ref and call Notify). The handler receives IBrowserFile instances and must copy each one via e.OpenReadStream(file) (50 MB cap) into IDocumentStorage before it returns; use file.Size / file.ContentType instead of ContentLength / ContentType from HttpPostedFile.", "files": ["Default.aspx", "Default.aspx.cs"]}
+    /// <summary>
+    /// Raised once the picked files have passed size, count and extension checks. The page
+    /// stores them and runs the pipeline; this control only deals with the form. The files
+    /// must be read (through <see cref="UploadEventArgs.OpenReadStream"/>) before the handler
+    /// completes.
+    /// </summary>
+    [Parameter] public EventCallback<UploadEventArgs> UploadRequested { get; set; }
+
+    /// <summary>
+    /// Messages owned by the hosting page (processed / failed / could not load ...), shown
+    /// under the dropzone together with this control's own validation messages.
+    /// </summary>
+    [Parameter] public IReadOnlyList<Notification> Notifications { get; set; }
+
+    private StorageOptions Storage => StorageOptionsAccessor.Value;
+
+    private IEnumerable<Notification> AllNotifications =>
+        (Notifications ?? Array.Empty<Notification>()).Concat(_notifications);
+
+    private string IdleLabel => selectedFiles.Count == 1
+        ? "Upload 1 file"
+        : $"Upload {selectedFiles.Count} files";
+
+    protected override void OnInitialized()
+    {
+        var extensions = (Storage.AllowedExtensions ?? Array.Empty<string>())
+            .Select(extension => extension.TrimStart('.').ToUpperInvariant());
+
+        // Razor encodes this on output; no HtmlEncode needed.
+        fileTypeSummary = string.Join(", ", extensions);
+    }
+
+    /// <summary>Adds a message shown under the dropzone. Callable by a parent holding an @ref.</summary>
+    public void Notify(string text, NotificationLevel level)
+    {
+        _notifications.Add(new Notification(text, level));
+        InvokeAsync(StateHasChanged);
+    }
+
+    /// <summary>Removes the messages this control added (the page's own list is left alone).</summary>
+    public void ClearNotifications()
+    {
+        _notifications.Clear();
+        InvokeAsync(StateHasChanged);
+    }
+
+    private void OnFilesChosen(InputFileChangeEventArgs e)
+    {
+        // Take every picked file here; the count limit is applied (with a message) on upload,
+        // exactly as the server did for the posted form.
+        selectedFiles = e.FileCount == 0
+            ? new List<IBrowserFile>()
+            : e.GetMultipleFiles(e.FileCount).ToList();
+    }
+
+    private void Reset()
+    {
+        if (submitting)
+        {
+            return;
+        }
+
+        selectedFiles = new List<IBrowserFile>();
+        statusText = string.Empty;
+
+        // Re-keying the InputFile replaces the <input type="file">, which empties it.
+        pickerGeneration++;
+    }
+
+    private async Task UploadButton_Click()
+    {
+        if (submitting)
+        {
+            return;
+        }
+
+        // Each upload starts with a fresh set of messages, as each postback did.
+        _notifications.Clear();
+
+        var accepted = new List<IBrowserFile>();
+        var maxFiles = Storage.MaxFilesPerUpload;
+        var maxBytes = Storage.MaxFileSizeBytes;
+        var allowed = Storage.AllowedExtensions ?? Array.Empty<string>();
+
+        var posted = selectedFiles
+            .Where(file => file != null && !string.IsNullOrEmpty(file.Name))
+            .ToList();
+
+        if (posted.Count == 0)
+        {
+            Notify("Choose at least one file to upload.", NotificationLevel.Warning);
+            return;
+        }
+
+        if (posted.Count > maxFiles)
+        {
+            Notify(
+                string.Format("Only the first {0} files were taken from this upload.", maxFiles),
+                NotificationLevel.Warning);
+
+            posted = posted.Take(maxFiles).ToList();
+        }
+
+        foreach (var file in posted)
+        {
+            var name = Path.GetFileName(file.Name);
+
+            if (file.Size > maxBytes || file.Size > UploadEventArgs.MaxAllowedSize)
+            {
+                Notify(
+                    string.Format("'{0}' exceeds {1} MB", name, Storage.MaxFileSizeMegabytes),
+                    NotificationLevel.Warning);
+                continue;
+            }
+
+            var extension = Path.GetExtension(name).ToLowerInvariant();
+
+            if (!allowed.Contains(extension) || !DocumentTextExtractor.CanExtract(extension))
+            {
+                Notify(
+                    string.Format("'{0}' is not a supported file type", name),
+                    NotificationLevel.Warning);
+                continue;
+            }
+
+            accepted.Add(file);
+        }
+
+        if (accepted.Count == 0 || !UploadRequested.HasDelegate)
+        {
+            return;
+        }
+
+        submitting = true;
+        var count = accepted.Count;
+        statusText = "Uploading " + count + (count == 1 ? " file" : " files")
+            + ". Each document is summarized after it is stored, so this can take"
+            + " a while. Leaving the page cancels it.";
+        StateHasChanged();
+
+        try
+        {
+            await UploadRequested.InvokeAsync(new UploadEventArgs(accepted));
+        }
+        finally
+        {
+            submitting = false;
+            Reset();
+        }
+    }
+
+    private static string FormatSize(long bytes)
+    {
+        var units = new[] { "B", "KB", "MB", "GB" };
+        double size = bytes;
+        var unit = 0;
+        while (size >= 1024 && unit < units.Length - 1)
+        {
+            size /= 1024;
+            unit++;
+        }
+
+        return Math.Round(size, 2).ToString(System.Globalization.CultureInfo.InvariantCulture) + " " + units[unit];
+    }
+}
